@@ -42,3 +42,7 @@ pip install fastmcp
   }
 }
 ```
+
+## Contribute Docs
+
+https://github.com/Corzed/Docs
