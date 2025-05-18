@@ -3,49 +3,44 @@ import urllib.request
 import urllib.parse
 import json
 import time
+import re
 
 class Cache:
-    def __init__(self, ttl=3600):  # TTL in seconds (1 hour default)
+    def __init__(self, ttl=3600):
         self.cache = {}
         self.ttl = ttl
     
     def get(self, key):
-        if key not in self.cache:
-            return None
-            
-        entry = self.cache[key]
-        current_time = time.time()
-        
-        # Check if entry has decayed (expired)
-        if current_time - entry['timestamp'] > self.ttl:
-            del self.cache[key]
-            return None
-            
-        return entry['data']
+        if key in self.cache and time.time() - self.cache[key]['timestamp'] <= self.ttl:
+            return self.cache[key]['data']
+        return None
     
     def set(self, key, data):
-        self.cache[key] = {
-            'data': data,
-            'timestamp': time.time()
-        }
+        self.cache[key] = {'data': data, 'timestamp': time.time()}
 
 class DocsMCP:
     def __init__(self, name="DocsMCP", repo="Corzed/Docs", branch="master"):
         self.mcp = FastMCP(name=name)
+        self.repo = repo
+        self.branch = branch
         self.root_url = f"https://cdn.jsdelivr.net/gh/{repo}@{branch}"
-        self.docs_url = f"{self.root_url}/docs"
         self.cache = Cache()
         self.site_structure = None
         
-        # Register tools
         self.mcp.tool(name="get_docs", description="Get documents or list directories")(self.get_docs)
         self.mcp.tool(name="list_directory", description="List contents of a directory")(self.list_directory)
     
+    def normalize_path(self, path):
+        path = path.strip().strip('/')
+        path = re.sub(r'/+', '/', path)
+        path = re.sub(r'\s*/\s*', '/', path)
+        parts = [part.strip() for part in path.split('/')]
+        return '/'.join(filter(None, parts))
+    
     def fetch_url(self, url):
-        """Fetch content from a URL with decay-based caching"""
-        cached_content = self.cache.get(url)
-        if cached_content:
-            return cached_content
+        cached = self.cache.get(url)
+        if cached:
+            return cached
         
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'DocsMCP/1.0'})
@@ -53,53 +48,115 @@ class DocsMCP:
                 content = response.read().decode('utf-8')
                 self.cache.set(url, content)
                 return content
-        except Exception as e:
-            return f"Error: {str(e)}"
+        except:
+            return None
     
-    def get_docs(self, path: str = "") -> str:
-        """Get document content"""
-        clean_path = path.strip('/')
-        encoded_path = '/'.join(urllib.parse.quote(component) for component in clean_path.split('/'))
-        url = f"{self.docs_url}/{encoded_path}"
+    def is_file_path(self, path):
+        if not path:
+            return False
         
+        path = self.normalize_path(path)
+        structure = self.get_structure()
+        current = structure
+        
+        for i, part in enumerate(path.split('/')):
+            if part not in current.get("children", {}):
+                return False
+            
+            if i == len(path.split('/')) - 1:
+                return current["children"][part].get("type") == "file"
+            
+            current = current["children"][part]
+        
+        return False
+    
+    def get_docs(self, path=""):
+        clean_path = self.normalize_path(path)
+        
+        if not clean_path:
+            return "Error: Empty path. Use list_directory to see available directories."
+        
+        if not self.is_file_path(clean_path):
+            return f"Error: '{path}' is not a valid document. Use list_directory to navigate."
+        
+        parts = clean_path.split('/')
+        encoded_parts = [urllib.parse.quote(part) for part in parts]
+        url = f"{self.root_url}/docs/{'/'.join(encoded_parts)}"
         content = self.fetch_url(url)
+        
+        if not content:
+            return f"Error: Could not fetch document at '{path}'"
+        
         return f"Content of '{path}':\n\n{content}"
     
     def get_structure(self):
-        """Load the site structure once and cache it"""
-        if not self.site_structure:
-            content = self.fetch_url(f"{self.root_url}/_site_structure.json")
-            try:
-                self.site_structure = json.loads(content)
-            except:
-                return None
-        return self.site_structure
+        if self.site_structure:
+            return self.site_structure
+        
+        api_url = f"https://data.jsdelivr.com/v1/package/gh/{self.repo}@{self.branch}/flat"
+        content = self.fetch_url(api_url)
+        
+        if not content:
+            return {"children": {}}
+        
+        try:
+            file_list = json.loads(content)
+            structure = {"children": {}}
+            
+            for file in file_list.get("files", []):
+                path = file.get("name", "")
+                
+                if not path.startswith("/docs/"):
+                    continue
+                
+                logical_path = self.normalize_path(path[6:])
+                if not logical_path:
+                    continue
+                
+                parts = logical_path.split('/')
+                current = structure
+                
+                for i, part in enumerate(parts):
+                    is_file = (i == len(parts) - 1)
+                    
+                    if is_file:
+                        current["children"][part] = {"type": "file"}
+                    else:
+                        if part not in current["children"]:
+                            current["children"][part] = {"type": "directory", "children": {}}
+                        current = current["children"][part]
+            
+            self.site_structure = structure
+            return structure
+        except:
+            return {"children": {}}
     
-    def list_directory(self, path: str = "") -> str:
-        """List contents of a directory using the site structure"""
+    def list_directory(self, path=""):
+        clean_path = self.normalize_path(path)
         structure = self.get_structure()
-        if not structure:
-            return "Error: Could not load site structure"
-        
-        # Navigate to requested directory
         current = structure
-        for part in filter(None, path.split('/')):
-            if part in current.get('children', {}):
-                current = current['children'][part]
-            else:
-                return f"Directory not found: {path}"
         
-        # List contents
+        if clean_path:
+            for part in clean_path.split('/'):
+                if part not in current.get("children", {}):
+                    return f"Directory not found: {path}"
+                current = current["children"][part]
+                if current.get("type") != "directory":
+                    return f"Error: '{path}' is a file, not a directory"
+        
         result = f"Contents of '{path}':\n\n"
-        for name, item in current.get('children', {}).items():
-            prefix = "📁 " if item["type"] == "directory" else "📄 "
-            title = item.get('title', name)
-            result += f"{prefix} {name} - {title}\n"
+        items = sorted(current.get("children", {}).items())
+        
+        if not items:
+            return result + "Directory is empty"
+        
+        for name, item in items:
+            prefix = "📁 " if item.get("type") == "directory" else "📄 "
+            result += f"{prefix} {name}\n"
         
         return result
     
     def run(self):
-        """Run the MCP server"""
         self.mcp.run(transport='stdio')
 
 if __name__ == "__main__":
